@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AR Gesture Viz Bonus Project</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        #video { position: absolute; visibility: hidden; }
+        canvas { position: absolute; top: 0; left: 0; }
+    </style>
+</head>
+<body>
+    <video id="video" playsinline></video>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const videoElement = document.getElementById('video');
+        let scene, camera, renderer, line;
+        let points = [];
+
+        // 1. 初始化 Three.js 场景
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            camera.position.z = 5;
+        }
+
+        // 2. 创建 3D 线条物体
+        function initLine() {
+            const geometry = new THREE.BufferGeometry();
+            const material = new THREE.LineBasicMaterial({ color: 0x00ffcc, linewidth: 5 });
+            line = new THREE.Line(geometry, material);
+            scene.add(line);
+        }
+
+        // 3. 处理手势结果
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const hand = results.multiHandLandmarks[0];
+                const indexFinger = hand[8]; // 食指指尖
+
+                // 核心：将 MediaPipe 归一化坐标转为 Three.js 坐标
+                const x = (indexFinger.x - 0.5) * 10;
+                const y = -(indexFinger.y - 0.5) * 6;
+                const z = -indexFinger.z * 10;
+
+                // 简单的绘制逻辑：如果食指高于大拇指则画图 (可以自定义交互)
+                if (indexFinger.y < hand[4].y) {
+                    points.push(new THREE.Vector3(x, y, z));
+                    updateLine();
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        function updateLine() {
+            line.geometry.setFromPoints(points);
+        }
+
+        // 启动 MediaPipe
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        const cameraMP = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+
+        initThree();
+        initLine();
+        cameraMP.start();
+    </script>
+</body>
+</html>

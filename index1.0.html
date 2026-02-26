@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AR Gesture Viz Bonus Project</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        #video { position: absolute; visibility: hidden; }
+        canvas { position: absolute; top: 0; left: 0; }
+    </style>
+</head>
+<body>
+    <video id="video" playsinline></video>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const videoElement = document.getElementById('video');
+        let scene, camera, renderer;
+        let meshes = []; // 必须定义这个数组！
+        let points = []; 
+        let currentLine = null; // 用于存储当前正在画的那根线
+        let previewMesh = null; 
+        let currentShapeType = 'cube'; // 默认初始形状
+        let lastFinalizeTime = 0; // 记录上一次放置的时间戳
+        const COOLDOWN_MS = 1000; // 冷却时间，1000毫秒（1秒）
+        let currentColor = new THREE.Color(0x00ffcc);
+        let leftHandVisible = false;
+
+        // 1. 初始化场景
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            camera.position.z = 5;
+
+            // 添加一个环境光，让物体更好看
+            const light = new THREE.AmbientLight(0xffffff, 1);
+            scene.add(light);
+        }
+
+        // 监听键盘切换
+        window.addEventListener('keydown', (e) => {
+            const keys = {'0':'line', '1':'cube', '2':'sphere', '3':'cylinder', '4':'cone'};
+            if (keys[e.key]) {
+                currentShapeType = keys[e.key];
+                // 切换模式时清空预览，防止形状混乱
+                if (previewMesh) {
+                    scene.remove(previewMesh);
+                    previewMesh = null;
+                }
+                console.log("当前模式:", currentShapeType);
+            }
+            // 撤销
+            if (e.key.toLowerCase() === 'z') {
+                if (meshes.length > 0) {
+                    const lastMesh = meshes.pop();
+                    scene.remove(lastMesh);
+                    console.log("已撤销上一个物体");
+                }
+            }
+            // 清屏
+            if (e.key === 'c' || e.key === 'C') {
+                meshes.forEach(m => scene.remove(m));
+                meshes = [];
+                console.log("画布已清空");
+            }
+        });
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const hand = results.multiHandLandmarks[0];
+                const thumbTip = hand[4];
+                const indexTip = hand[8];
+                const middleTip = hand[12]; // 中指尖
+
+                // 1. 坐标映射 (已修复镜像)
+                const pos = new THREE.Vector3(-(indexTip.x - 0.5) * 10, -(indexTip.y - 0.5) * 6, -indexTip.z * 10);
+                
+                // 2. 计算间距
+                // 食指-大拇指：用于控制大小
+                const distIndexThumb = Math.sqrt(Math.pow(indexTip.x - thumbTip.x, 2) + Math.pow(indexTip.y - thumbTip.y, 2));
+                // 中指-大拇指：用于确认放置 (Action Key)
+                const distMiddleThumb = Math.sqrt(Math.pow(middleTip.x - thumbTip.x, 2) + Math.pow(middleTip.y - thumbTip.y, 2));
+
+                // --- 逻辑判断 ---
+                const isIndexPinching = distIndexThumb < 0.3;  // 食指大拇指靠近：激活/调整
+                const isMiddlePinching = distMiddleThumb < 0.06; // 中指大拇指碰触：定格
+
+                if (currentShapeType === 'line') {
+                    // 划线逻辑保持相对简单，或者也可以用中指控制开关
+                    if (isIndexPinching) {
+                        points.push(pos.clone());
+                        updateLine();
+                    } else {
+                        points = []; 
+                        currentLine = null;
+                    }
+                } else {
+                // 在 onResults 函数内部
+                if (isIndexPinching) {
+                    updatePreview(pos, distIndexThumb);
+                    
+                    // 增加时间判定：中指碰大拇指 且 距离上次放置超过 1 秒
+                    const currentTime = Date.now();
+                    if (isMiddlePinching && previewMesh && (currentTime - lastFinalizeTime > COOLDOWN_MS)) {
+                        finalizeShape();
+                        lastFinalizeTime = currentTime; // 更新最后一次放置的时间
+                    }
+                } else {
+                    if (previewMesh) {
+                        scene.remove(previewMesh);
+                        previewMesh = null;
+                    }
+                }
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        function updateLine() {
+            if (!currentLine) {
+                const geometry = new THREE.BufferGeometry();
+                const material = new THREE.LineBasicMaterial({ color: 0x00ffcc, linewidth: 5 });
+                currentLine = new THREE.Line(geometry, material);
+                scene.add(currentLine);
+                meshes.push(currentLine); // 存入数组方便管理
+            }
+            currentLine.geometry.setFromPoints(points);
+        }
+
+        function updatePreview(pos, distance) {
+            if (!previewMesh) {
+                let geo;
+                if (currentShapeType === 'cube') geo = new THREE.BoxGeometry(1, 1, 1);
+                if (currentShapeType === 'sphere') geo = new THREE.SphereGeometry(1, 32, 32);
+                if (currentShapeType === 'cylinder') geo = new THREE.CylinderGeometry(0.5, 0.5, 1, 32);
+                if (currentShapeType === 'cone') geo = new THREE.ConeGeometry(0.5, 1, 32);
+
+                previewMesh = new THREE.Mesh(geo, new THREE.MeshNormalMaterial({ transparent: true, opacity: 0.6 }));
+                scene.add(previewMesh);
+            }
+            previewMesh.position.copy(pos);
+
+            // 间距映射：distance 越大，物体越大
+            // 这里的 15 是灵敏度系数，你可以根据需要调成 10 或 20
+            const scale = Math.max(0.05, distance * 5); 
+            previewMesh.scale.set(scale, scale, scale);
+        }
+
+        function finalizeShape() {
+            const finalMesh = previewMesh.clone();
+            finalMesh.material = new THREE.MeshNormalMaterial(); // 变为不透明实体
+            
+            // 💡 小技巧：给放置好的物体一个微小的随机旋转，
+            // 这样即便你真的放重叠了，也能一眼看出是两个物体
+            finalMesh.rotation.set(Math.random()*0.1, Math.random()*0.1, Math.random()*0.1);
+            
+            scene.add(finalMesh);
+            meshes.push(finalMesh);
+            
+            // 放置后立即销毁预览
+            scene.remove(previewMesh);
+            previewMesh = null;
+
+            // 可以在控制台打印一下，方便你调试
+            console.log("物体已固定，总数:", meshes.length);
+        }
+
+        // 启动步奏
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        const cameraMP = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+
+        initThree();
+        cameraMP.start();
+    </script>
+</body>
+</html>

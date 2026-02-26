@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AR Gesture Viz Pro - Demo Version</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        
+        /* 1. 修复：左下角视频预览窗 */
+        #video { 
+            position: absolute; 
+            bottom: 20px; 
+            right: 20px; 
+            width: 360px; /* 小窗口宽度 */
+            height: auto;
+            border: 3px solid #00ffcc; 
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            z-index: 1000;
+            transform: scaleX(-1); /* 镜像翻转，看起来更自然 */
+        }
+        
+        canvas { position: absolute; top: 0; left: 0; }
+        
+        /* 调色条 UI */
+        #colorBar {
+            position: absolute;
+            left: 30px;
+            top: 20%;
+            width: 25px;
+            height: 60%;
+            background: linear-gradient(to bottom, #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%);
+            border: 2px solid white;
+            border-radius: 15px;
+            display: none; 
+            z-index: 100;
+        }
+        #cursor {
+            position: absolute;
+            width: 35px;
+            left: -7px;
+            height: 6px;
+            background: white;
+            border: 1px solid black;
+            top: 50%;
+            transition: top 0.1s;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 12px 24px;
+            border-radius: 30px;
+            pointer-events: none;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .status-tag { color: #00ffcc; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <video id="video" playsinline></video>
+    
+    <div id="colorBar">
+        <div id="cursor"></div>
+    </div>
+
+    <div id="info">
+        Keys: 0 (Line), 1 (Cube), 2(Sphere), 3(Cylinder), 4(Cone) | Z (Undo), C (Clear), P (Lock Color), U(adjust light source)
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const videoElement = document.getElementById('video');
+        const colorBar = document.getElementById('colorBar');
+        const cursor = document.getElementById('cursor');
+        const modeText = document.getElementById('mode-text');
+
+        let scene, camera, renderer;
+        let meshes = []; 
+        let points = []; 
+        let currentLine = null; 
+        let previewMesh = null; 
+        let currentShapeType = 'cube'; 
+        let lastFinalizeTime = 0; 
+        const COOLDOWN_MS = 800; 
+        let currentColor = new THREE.Color(0x00ffcc); 
+        let savedColor = new THREE.Color(0x00ffcc);  
+        let isColorLocked = false; 
+        
+        let pointLight, lightSphere;
+        let isLightMode = false; // 初始为绘图模式
+
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            camera.position.z = 5;
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            pointLight = new THREE.PointLight(0xffffff, 1.8, 25);
+            pointLight.position.set(2, 2, 2);
+            scene.add(pointLight);
+
+            const sphereGeo = new THREE.SphereGeometry(0.12, 16, 16);
+            const sphereMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            lightSphere = new THREE.Mesh(sphereGeo, sphereMat);
+            lightSphere.visible = false;
+            scene.add(lightSphere);
+        }
+
+        window.addEventListener('keydown', (e) => {
+            const keys = {'0':'line', '1':'cube', '2':'sphere', '3':'cylinder', '4':'cone'};
+            if (keys[e.key]) {
+                currentShapeType = keys[e.key];
+                if (previewMesh) { scene.remove(previewMesh); previewMesh = null; }
+            }
+            if (e.key.toLowerCase() === 'z' && meshes.length > 0) {
+                const last = meshes.pop();
+                scene.remove(last);
+            }
+            if (e.key.toLowerCase() === 'c') {
+                meshes.forEach(m => scene.remove(m));
+                meshes = [];
+            }
+            if (e.key.toLowerCase() === 'p') {
+                isColorLocked = !isColorLocked;
+                colorBar.style.opacity = isColorLocked ? "0.3" : "1.0";
+            }
+            // U 键切换：进入光源模式时，预览物体必须消失
+            if (e.key.toLowerCase() === 'u') {
+                isLightMode = !isLightMode;
+                lightSphere.visible = isLightMode;
+                modeText.innerHTML = isLightMode ? "Current Mode: <b style='color:#ffcc00'>Light Tuning</b>" : "Current Mode: <b>Drawing</b>";
+                
+                // 细节改动1：切换时立刻清除预览
+                if (isLightMode && previewMesh) {
+                    scene.remove(previewMesh);
+                    previewMesh = null;
+                }
+            }
+        });
+
+        function onResults(results) {
+            let rightHand = null; 
+            let leftHand = null;  
+
+            if (results.multiHandLandmarks && results.multiHandedness) {
+                results.multiHandLandmarks.forEach((landmarks, index) => {
+                    const label = results.multiHandedness[index].label;
+                    if (label === 'Left') rightHand = landmarks; 
+                    if (label === 'Right') leftHand = landmarks;
+                });
+            }
+
+            // 处理左手 (调色 + 灯光)
+            if (leftHand) {
+                if (!isColorLocked && !isLightMode) {
+                    colorBar.style.display = 'block';
+                    const lThumb = leftHand[4];
+                    const lIndex = leftHand[8];
+                    let diff = lThumb.y - lIndex.y; 
+                    let hueValue = Math.min(Math.max(diff / 0.2 - 0.25, 0), 1);
+                    savedColor.setHSL(hueValue, 0.9, 0.5);
+                    currentColor.copy(savedColor);
+                    cursor.style.top = (hueValue * 100) + '%';
+                }
+
+            if (isLightMode) {
+                const lPalm = leftHand[9];
+                // 关键修改：我们在 Z 轴上减去一个数值（或者加上一个正值）
+                // 在 Three.js 的右手坐标系中，Z 增加是朝着屏幕外的（也就是靠近你的脸）
+                // 我们把 Z 设置在 3 到 5 左右，光源就会处于物体和相机之间
+                const lightPos = new THREE.Vector3(
+                    -(lPalm.x - 0.5) * 10, 
+                    -(lPalm.y - 0.5) * 6, 
+                    3.5 // 强制将 Z 固定在一个靠近相机的平面，或者用 -lPalm.z * 10 + 5
+                );
+                
+                pointLight.position.copy(lightPos);
+                lightSphere.position.copy(lightPos);
+            }
+            } else {
+                if (!isColorLocked) colorBar.style.display = 'none';
+            }
+
+            // 处理右手 (绘图)
+            if (rightHand) {
+                const rThumb = rightHand[4];
+                const rIndex = rightHand[8];
+                const rMiddle = rightHand[12];
+
+                const posIndex = new THREE.Vector3(-(rIndex.x - 0.5) * 10, -(rIndex.y - 0.5) * 6, -rIndex.z * 10);
+                const posThumb = new THREE.Vector3(-(rThumb.x - 0.5) * 10, -(rThumb.y - 0.5) * 6, -rThumb.z * 10);
+                const midPos = new THREE.Vector3().addVectors(posIndex, posThumb).multiplyScalar(0.5);
+                
+                const distIndexThumb = posIndex.distanceTo(posThumb);
+                const distMiddleThumb = Math.sqrt(Math.pow(rMiddle.x - rThumb.x, 2) + Math.pow(rMiddle.y - rThumb.y, 2));
+
+                const isIndexPinching = distIndexThumb < 2.5; 
+                const isMiddlePinching = distMiddleThumb < 0.07;
+
+                // 细节改动1：如果在 LightMode 模式，不执行预览和放置逻辑
+                if (!isLightMode) {
+                    if (currentShapeType === 'line') {
+                        if (isIndexPinching) {
+                            points.push(midPos.clone());
+                            updateLine();
+                        } else {
+                            points = []; currentLine = null;
+                        }
+                    } else {
+                        if (isIndexPinching) {
+                            updatePreview(midPos, distIndexThumb, posIndex);
+                            const now = Date.now();
+                            if (isMiddlePinching && previewMesh && (now - lastFinalizeTime > COOLDOWN_MS)) {
+                                finalizeShape();
+                                lastFinalizeTime = now;
+                            }
+                        } else if (previewMesh) {
+                            scene.remove(previewMesh);
+                            previewMesh = null;
+                        }
+                    }
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        function updateLine() {
+            if (!currentLine) {
+                const geo = new THREE.BufferGeometry();
+                const mat = new THREE.LineBasicMaterial({ color: currentColor.clone(), linewidth: 5 });
+                currentLine = new THREE.Line(geo, mat);
+                scene.add(currentLine);
+                meshes.push(currentLine);
+            }
+            currentLine.geometry.setFromPoints(points);
+        }
+
+        function updatePreview(pos, distance, targetPos) {
+            if (!previewMesh) {
+                let geo;
+                if (currentShapeType === 'cube') geo = new THREE.BoxGeometry(1, 1, 1);
+                if (currentShapeType === 'sphere') geo = new THREE.SphereGeometry(0.6, 32, 32);
+                if (currentShapeType === 'cylinder') geo = new THREE.CylinderGeometry(0.4, 0.4, 1, 32);
+                if (currentShapeType === 'cone') geo = new THREE.ConeGeometry(0.5, 1, 32);
+
+                previewMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ 
+                    transparent: true, opacity: 0.6, metalness: 0.6, roughness: 0.2 
+                }));
+                scene.add(previewMesh);
+            }
+            previewMesh.position.copy(pos);
+            previewMesh.material.color.copy(currentColor);
+            const s = Math.max(0.1, distance * 1.2);
+            previewMesh.scale.set(s, s, s);
+            previewMesh.lookAt(targetPos);
+            if (currentShapeType === 'cylinder' || currentShapeType === 'cone') previewMesh.rotateX(Math.PI / 2);
+        }
+
+        function finalizeShape() {
+            const final = previewMesh.clone();
+            final.material = new THREE.MeshStandardMaterial({
+                color: savedColor.clone(),
+                metalness: 0.6,
+                roughness: 0.2
+            });
+            scene.add(final);
+            meshes.push(final);
+            scene.remove(previewMesh);
+            previewMesh = null;
+        }
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6 });
+        hands.onResults(onResults);
+
+        const cameraMP = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+
+        initThree();
+        cameraMP.start();
+    </script>
+</body>
+</html>
